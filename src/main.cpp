@@ -17,8 +17,17 @@
 
 // ---------------------------------------------------------------- config ----
 
-// Fill these in after the first boot: the serial log prints every "MASK..." device
-// it sees with its address. Leave "" to auto-assign by discovery order.
+// Each device is picked by the start of its advertised name, e.g. "MASK-1A2B3C"
+// and "GLASS-961DFF". Other gadgets nearby (e.g. barcode readers) reuse the
+// generic fff0 service, so the name is the only reliable filter. Every other
+// nearby device is printed once at scan time.
+static const char* NAME_PREFIX[2] = {
+  "MASK",    // [0] full mask
+  "GLASS",   // [1] glasses
+};
+
+// Optional: pin a device by address instead (overrides the name match), useful
+// if you own two of the same kind. The serial log prints each device's address.
 static const char* MASK_ADDR[2] = {
   "",   // [0] full mask,   e.g. "aa:bb:cc:dd:ee:ff"
   "",   // [1] glasses
@@ -55,12 +64,15 @@ enum MaskState : uint8_t { IDLE, CONNECTING, DISCOVER, READY };
 struct Mask {
   const char* label;
   NimBLEAddress addr;
+  std::string name;  // advertised name, for the log
   volatile bool known;
   volatile MaskState state;
   NimBLEClient* client;
   NimBLERemoteCharacteristic* cmd;
   uint32_t nextAttempt;
-  Mask(const char* l) : label(l), known(false), state(IDLE), client(nullptr), cmd(nullptr), nextAttempt(0) {}
+  bool dumped;  // GATT table already printed
+  Mask(const char* l)
+      : label(l), known(false), state(IDLE), client(nullptr), cmd(nullptr), nextAttempt(0), dumped(false) {}
   bool connected() { return state == READY && client->isConnected() && cmd; }
 };
 static Mask masks[2] = {Mask("mask"), Mask("glasses")};
@@ -119,41 +131,77 @@ class ClientCallbacks : public NimBLEClientCallbacks {
   }
 } clientCallbacks;
 
+// Print each nearby non-matching device once (named or not), with the service
+// UUIDs and manufacturer data it advertises, so unknown devices can be identified.
+// Hold the device close to the ESP32: anything weaker than LOG_MIN_RSSI is skipped.
+static const int LOG_MIN_RSSI = -70;
+
+static void logOther(const NimBLEAdvertisedDevice* d) {
+  if (d->getRSSI() < LOG_MIN_RSSI) return;
+  static std::vector<NimBLEAddress> seen;
+  for (auto& a : seen)
+    if (a == d->getAddress()) return;
+  if (seen.size() >= 64) seen.clear();
+  seen.push_back(d->getAddress());
+
+  Serial.printf("  other \"%s\" %s rssi %d", d->getName().c_str(), d->getAddress().toString().c_str(),
+                d->getRSSI());
+  for (int i = 0; i < d->getServiceUUIDCount(); i++)
+    Serial.printf(" svc %s", d->getServiceUUID(i).toString().c_str());
+  if (d->haveManufacturerData()) {
+    Serial.print(" mfr");
+    for (uint8_t b : d->getManufacturerData()) Serial.printf(" %02x", b);
+  }
+  Serial.println();
+}
+
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* d) override {
     std::string name = d->getName();
-    if (name.rfind("MASK", 0) != 0 && !d->isAdvertisingService(SERVICE_UUID)) return;
     const NimBLEAddress& a = d->getAddress();
-    for (auto& m : masks)
-      if (m.known && m.addr == a) return;  // already assigned
-    Serial.printf("  found \"%s\" %s rssi %d\n", name.c_str(), a.toString().c_str(), d->getRSSI());
-
     for (int k = 0; k < 2; k++) {
-      if (MASK_ADDR[k][0] && strcasecmp(a.toString().c_str(), MASK_ADDR[k]) == 0) {
-        masks[k].addr = a; masks[k].known = true;
-        return;
-      }
-    }
-    // Auto-assign by discovery order when addresses aren't configured.
-    for (int k = 0; k < 2; k++) {
-      if (MASK_ADDR[k][0] || masks[k].known) continue;
-      masks[k].addr = a; masks[k].known = true;
-      Serial.printf("  -> assigned to %s\n", masks[k].label);
+      bool match = MASK_ADDR[k][0] ? strcasecmp(a.toString().c_str(), MASK_ADDR[k]) == 0
+                                   : name.rfind(NAME_PREFIX[k], 0) == 0;
+      if (!match) continue;
+      if (masks[k].known) return;  // already have one
+      masks[k].addr = a; masks[k].name = name; masks[k].known = true;
+      Serial.printf("  found \"%s\" %s rssi %d -> %s\n", name.c_str(), a.toString().c_str(), d->getRSSI(),
+                    masks[k].label);
       return;
     }
+    logOther(d);
   }
 } scanCallbacks;
+
+// Print every service/characteristic the device exposes. Used to work out the
+// protocol of devices that don't match the Shining Mask layout.
+static void dumpGatt(Mask& m) {
+  Serial.printf("[%s] GATT table of \"%s\" %s:\n", m.label, m.name.c_str(), m.addr.toString().c_str());
+  for (NimBLERemoteService* svc : m.client->getServices(true)) {
+    Serial.printf("  service %s\n", svc->getUUID().toString().c_str());
+    for (NimBLERemoteCharacteristic* c : svc->getCharacteristics(true)) {
+      Serial.printf("    char %s %s%s%s%s%s\n", c->getUUID().toString().c_str(),
+                    c->canRead() ? " read" : "", c->canWrite() ? " write" : "",
+                    c->canWriteNoResponse() ? " write-no-rsp" : "", c->canNotify() ? " notify" : "",
+                    c->canIndicate() ? " indicate" : "");
+    }
+  }
+}
 
 static void finishConnect(Mask& m) {
   NimBLERemoteService* svc = m.client->getService(SERVICE_UUID);
   m.cmd = svc ? svc->getCharacteristic(CMD_UUID) : nullptr;
+
   if (!m.cmd) {
-    Serial.printf("[%s] service/characteristic not found\n", m.label);
+    Serial.printf("[%s] \"%s\" has no Shining Mask command characteristic\n", m.label, m.name.c_str());
+    if (!m.dumped) { dumpGatt(m); m.dumped = true; }
     m.client->disconnect();
+    m.state = IDLE;
+    m.nextAttempt = millis() + 30000;  // don't hammer a device we can't drive
     return;
   }
   m.state = READY;
-  Serial.printf("[%s] connected %s\n", m.label, m.addr.toString().c_str());
+  Serial.printf("[%s] connected \"%s\" %s\n", m.label, m.name.c_str(), m.addr.toString().c_str());
 }
 
 static void serviceBle() {
